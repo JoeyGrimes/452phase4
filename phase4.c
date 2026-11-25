@@ -17,16 +17,13 @@
 #include "phase3_usermode.h"
 
 typedef struct SleepingProcess{
-    int isAsleep; // 0 if the process is awake, 1 if its asleep
     int mailBoxID; //1 slot mailbox the brocess blocks until the clock driver wakes it
     int wakeUpTime; // clock cycle count when it will wake
+    struct SleepingProcess *next; // previous sleeping process in the chain of sleeping processes
 
 } SleepingProcess;
 
-//each is controlled by the control register and the status register
-//device input() CPU reads the status register
-//device output CPU writes to control register
-//impossible for cpu to writer to status register or read control register
+
 typedef struct Terminal{
     int cursorIndex; // index of the character we are currently on
     int write; //mailbox ID to prevent writing at the same time
@@ -40,7 +37,7 @@ typedef struct Terminal{
 
 static SleepingProcess sleepTable[MAXPROC];//1 entry per process slot index by pid%MACPROC
 static int timePassed = 0; // clock cycles counted so far
-
+static SleepingProcess *sleepHead = NULL;
 static Terminal Terminals[4];
 
 /*
@@ -56,13 +53,25 @@ int clockHandler(void *arg){
         waitDevice(USLOSS_CLOCK_DEV, 0, &status);
         timePassed++;
 
-        for (int i = 0; i < MAXPROC; i++){
-            SleepingProcess *curr = &sleepTable[i];
-            if (curr->isAsleep && curr->wakeUpTime <= timePassed){
-                curr->isAsleep = 0;
+        SleepingProcess *prev = NULL;
+        SleepingProcess *curr = sleepHead;
+        while (curr != NULL){
+            SleepingProcess *next = curr->next;
+            if (curr->wakeUpTime <= timePassed){
+                if (prev == NULL){
+                    sleepHead = next;
+                } else {
+                    prev->next = next;
+                }
+                curr->next = NULL;
                 MboxCondSend(curr->mailBoxID, NULL, 0);
+            } else {
+                prev = curr;
             }
+            curr = next;
         }
+
+
     }
     return 0;
 }
@@ -78,7 +87,8 @@ int clockHandler(void *arg){
 void kernelSleep(int seconds){
     SleepingProcess *spot = &sleepTable[getpid() % MAXPROC];
     spot->wakeUpTime = timePassed + seconds * 10;
-    spot->isAsleep = 1;
+    spot->next = sleepHead;
+    sleepHead = spot;
 
     MboxRecv(spot->mailBoxID, NULL, 0);
 }
@@ -129,7 +139,7 @@ void handle_one_terminal_interrupt(int unit, int status){
             currTerminal->cursorIndex++;
         }
     }
-    
+
     if (USLOSS_TERM_STAT_RECV(status) == USLOSS_DEV_BUSY) {
         char theChr = USLOSS_TERM_STAT_CHAR(status);
         currTerminal->lineBuf[currTerminal->lineLen] = theChr;
@@ -183,6 +193,7 @@ int kernelWrite(char* buffer, int bufferSize, int unitID){
     cr_val  |= 0x2;
     cr_val |= 0x4;
     cr_val |= ((unsigned char)buffer[0] << 8);
+
 
     currTerminal->writeLen = bufferSize;
     currTerminal->cursorIndex = 1;
@@ -292,7 +303,6 @@ void diskWriterHandler(USLOSS_Sysargs *args){
 void phase4_init() {
 
     for (int i = 0; i < MAXPROC; i++){
-        sleepTable[i].isAsleep = 0;
         sleepTable[i].mailBoxID = MboxCreate(1, 0);
     }
 
@@ -323,3 +333,4 @@ void phase4_start_service_processes(void){
         spork(processName, terminalInterruptHandler, (void *)(long)i, USLOSS_MIN_STACK, 2);
     }
 }
+
