@@ -25,19 +25,17 @@ typedef struct SleepingProcess{
 
 
 typedef struct Terminal{
-    int cursorIndex; // index of the character we are currently on
-    int write; //mailbox ID to prevent writing at the same time
-    int driverResponded; // mailbox ID to not continue until the driver has responded that it has read a character
-    char *writerBuffer; // buffer currently being written, its NULL when no write is in progress
-    int writeLen; //number of characters in the current write
-    int lineMbox;//mbox id holding up to 10 finished input lines
-    char lineBuf[MAXLINE];// this is the input line currently being typed
-    int lineLen; // numbers of chars in lineBuf so far
+    int write; // mailbox ID used as a lock so only one write happens on this terminal at a time
+    int charMbox; // 1 slot mailbox holding the next character for the driver to send
+    int lineMbox; // mailbox ID holding up to 10 finished input lines
+    char lineBuf[MAXLINE]; // the input line currently being typed
+    int lineLen; // number of characters in lineBuf so far
 } Terminal;
 
 static SleepingProcess sleepTable[MAXPROC];//1 entry per process slot index by pid%MACPROC
 static int timePassed = 0; // clock cycles counted so far
 static SleepingProcess *sleepHead = NULL;
+static int sleepRequests;
 static Terminal Terminals[4];
 
 /*
@@ -52,6 +50,12 @@ int clockHandler(void *arg){
     while(1){
         waitDevice(USLOSS_CLOCK_DEV, 0, &status);
         timePassed++;
+        
+        int slot;
+        while (MboxCondRecv(sleepRequests, &slot, sizeof(int)) >= 0) {
+            sleepTable[slot].next = sleepHead;
+            sleepHead = &sleepTable[slot];
+        }
 
         SleepingProcess *prev = NULL;
         SleepingProcess *curr = sleepHead;
@@ -85,11 +89,11 @@ int clockHandler(void *arg){
  * Params: int seconds, the number of seconds to sleep
  */
 void kernelSleep(int seconds){
-    SleepingProcess *spot = &sleepTable[getpid() % MAXPROC];
+    int slot = getpid() % MAXPROC;
+    SleepingProcess *spot = &sleepTable[slot];
     spot->wakeUpTime = timePassed + seconds * 10;
-    spot->next = sleepHead;
-    sleepHead = spot;
 
+    MboxSend(sleepRequests, &slot, sizeof(int));
     MboxRecv(spot->mailBoxID, NULL, 0);
 }
 
@@ -113,32 +117,16 @@ void sleepHandler(USLOSS_Sysargs *args){
 
 /*
  * Name: handle_one_terminal_interrupt
- * Purpose: handles one status value from a terminal. if a write is in progress
- * and the terminal is ready, it sends the next character, or if every 
- * character has been sent, it ends the write and wakes the writer. 
- * If a character arrived, it is added to the current line. A finished
- * line is sent to the terminal's line mailbox. Any lines past the 10th are dropped. 
- * Params: int unit, the terminal unit (0-3) andint status, the status 
- * register value returned by waitDevice()
+ * Purpose: This method handles one status value from a terminal. If a character arrived, it is added to the
+ * current line, and a finished line (newline or MAXLINE characters) is sent to the terminal's line mailbox;
+ * lines past the 10th are dropped. If the terminal is ready to send and a writer has left a character in the
+ * character mailbox, that character is sent. Both are checked because one status can report both at once.
+ * Params: int unit, the terminal unit (0-3)
+ *         int status, the status register value returned by waitDevice()
+ * Returns: None
  */
 void handle_one_terminal_interrupt(int unit, int status){
     Terminal *currTerminal = &Terminals[unit];
-    if (USLOSS_TERM_STAT_XMIT(status) == USLOSS_DEV_READY && currTerminal->writerBuffer != NULL){
-        if (currTerminal->cursorIndex == currTerminal->writeLen){
-            currTerminal->writerBuffer = NULL;
-            currTerminal->writeLen = 0;
-            MboxCondSend(currTerminal->driverResponded, NULL, 0);
-        }
-        else{
-            int cr_val = 0x1;
-            cr_val  |= 0x2;
-            cr_val |= 0x4;
-            cr_val |= ((unsigned char)currTerminal->writerBuffer[currTerminal->cursorIndex] << 8);
-
-            USLOSS_DeviceOutput(USLOSS_TERM_DEV, unit, (void*)(long)cr_val);
-            currTerminal->cursorIndex++;
-        }
-    }
 
     if (USLOSS_TERM_STAT_RECV(status) == USLOSS_DEV_BUSY) {
         char theChr = USLOSS_TERM_STAT_CHAR(status);
@@ -148,6 +136,16 @@ void handle_one_terminal_interrupt(int unit, int status){
         if (theChr == '\n' || currTerminal->lineLen == MAXLINE) {
             MboxCondSend(currTerminal->lineMbox, currTerminal->lineBuf, currTerminal->lineLen);
             currTerminal->lineLen = 0;
+        }
+    }
+
+    if (USLOSS_TERM_STAT_XMIT(status) == USLOSS_DEV_READY) {
+        char outChr;
+        if (MboxCondRecv(currTerminal->charMbox, &outChr, 1) == 1) {
+            // control register: 0x1 sends a char, 0x2 keeps receive interrupts on, 0x4 keeps transmit interrupts on,
+            // and the character itself goes in bits 8-15
+            int cr_val = 0x1 | 0x2 | 0x4 | ((unsigned char)outChr << 8);
+            USLOSS_DeviceOutput(USLOSS_TERM_DEV, unit, (void*)(long)cr_val);
         }
     }
 }
@@ -172,13 +170,14 @@ int terminalInterruptHandler(void *arg){
 
 /*
  * Name: kernelWrite
- * Purpose: Writes a buffer to a terminal atomically. It takes 
- * the terminal's write lock so no other write can start, sends the 
- * first character itself and only then hands the buffer to the driver
- * It blocks until the driver reports that every character has been sent
- * Params: char *buffer, the chars to write and int bufferSize, the number of chars to write
- * and int unitID, the terminal unit which can be(0-3)
- * Returns: The number of characters written, or 0 if nothing was to be written
+ * Purpose: This method writes a buffer to a terminal atomically. It takes the terminal's write lock so no other
+ * write can mix in, then hands the characters to the driver one at a time through the terminal's 1 slot
+ * character mailbox. Each send blocks until the driver has taken the previous character, so this returns once
+ * the last character has been handed off.
+ * Params: char *buffer, the characters to write
+ *         int bufferSize, the number of characters to write
+ *         int unitID, the terminal unit (0-3)
+ * Returns: The number of characters written, or 0 if there was nothing to write
  */
 int kernelWrite(char* buffer, int bufferSize, int unitID){
     if (bufferSize <= 0 || unitID > 3 || unitID < 0){
@@ -188,20 +187,9 @@ int kernelWrite(char* buffer, int bufferSize, int unitID){
     Terminal *currTerminal = &Terminals[unitID];
 
     MboxSend(currTerminal->write, NULL, 0);
-
-    int cr_val = 0x1;
-    cr_val  |= 0x2;
-    cr_val |= 0x4;
-    cr_val |= ((unsigned char)buffer[0] << 8);
-
-
-    currTerminal->writeLen = bufferSize;
-    currTerminal->cursorIndex = 1;
-    USLOSS_DeviceOutput(USLOSS_TERM_DEV, unitID, (void*)(long)cr_val);
-    currTerminal->writerBuffer = buffer;
-
-    MboxRecv(currTerminal->driverResponded, NULL, 0);
-
+    for (int i = 0; i < bufferSize; i++){
+        MboxSend(currTerminal->charMbox, &buffer[i], 1);
+    }
     MboxRecv(currTerminal->write, NULL, 0);
     return bufferSize;
 }
@@ -305,11 +293,12 @@ void phase4_init() {
     for (int i = 0; i < MAXPROC; i++){
         sleepTable[i].mailBoxID = MboxCreate(1, 0);
     }
+    sleepRequests = MboxCreate(MAXPROC, sizeof(int));
+
 
     for (int i = 0; i < 4; i++){
-        Terminals[i].write = MboxCreate(1,0);
-        Terminals[i].driverResponded = MboxCreate(1, 0);
-        Terminals[i].writerBuffer = NULL;
+        Terminals[i].write = MboxCreate(1, 0);
+        Terminals[i].charMbox = MboxCreate(1, 1);
         Terminals[i].lineMbox = MboxCreate(10, MAXLINE);
         Terminals[i].lineLen = 0;
     }
